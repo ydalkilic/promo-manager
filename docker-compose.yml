@@ -1,0 +1,136 @@
+# ModaCo Promotion Management API — full local stack.
+#
+#   docker compose up --build
+#
+# Brings up Postgres, Redis, the API, and a separate ingestion worker. The
+# worker is a distinct service on purpose: it is the local stand-in for the
+# serverless consumption plan, and running it apart from the API is what makes
+# the architecture demonstrable. Stop it mid-ingestion and start it again — the
+# job resumes from its last completed chunk rather than restarting.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: modaco
+      POSTGRES_PASSWORD: modaco
+      POSTGRES_DB: modaco
+    ports: ['5432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U modaco -d modaco']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # Cache AND queue in one instance, which forces a choice: `maxmemory-policy`
+    # is server-wide, so one policy has to serve both. It was `allkeys-lru`,
+    # which is right for a cache and wrong for a queue — BullMQ warns about it on
+    # every worker start, because under memory pressure Redis would evict queue
+    # keys and silently lose chunk jobs. Idempotency protects against a chunk
+    # being delivered twice, not against one vanishing.
+    #
+    # `noeviction` therefore wins: losing cached prices costs a Postgres round
+    # trip (the cache already falls through on failure), while losing a queued
+    # chunk costs data. With maxmemory set below the container limit, a full
+    # Redis fails writes loudly instead of discarding jobs quietly, and cache
+    # growth is bounded by the short TTLs the application sets anyway.
+    #
+    # The cleaner production split is two instances — an LRU cache and a
+    # noeviction queue — which is noted in the ADR.
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --maxmemory
+      - 384mb
+      - --maxmemory-policy
+      - noeviction
+    mem_limit: 512m
+    ports: ['6379:6379']
+    volumes: ['redisdata:/data']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    environment:
+      DATABASE_URL: postgresql://modaco:modaco@postgres:5432/modaco?schema=public
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: 'no'
+
+  api:
+    build: .
+    ports: ['3000:3000']
+    environment:
+      # statement_timeout=5s: a single runaway query must not hold a pool
+      # connection indefinitely and drain capacity from healthy requests.
+      DATABASE_URL: postgresql://modaco:modaco@postgres:5432/modaco?schema=public&connection_limit=20&pool_timeout=10&options=-c%20statement_timeout%3D5000
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      LOG_LEVEL: info
+      BLOB_STORAGE_ROOT: /app/storage
+      # Number of proxies in front of the API. Governs what req.ip resolves to
+      # and therefore what the rate limiter keys on.
+      TRUST_PROXY: '1'
+    volumes: ['./storage:/app/storage']
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:3000/health']
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    build: .
+    command: ['node', 'dist/adapters/local-runner/worker.js']
+    environment:
+      # 30s rather than the API's 5s: chunk batch writes are legitimately
+      # longer-running, and killing one mid-batch just forces a retry.
+      DATABASE_URL: postgresql://modaco:modaco@postgres:5432/modaco?schema=public&connection_limit=10&pool_timeout=10&options=-c%20statement_timeout%3D30000
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      LOG_LEVEL: info
+      BLOB_STORAGE_ROOT: /app/storage
+      # Each concurrent chunk holds a database connection. Keep this below the
+      # worker's connection_limit above, or chunks start failing on pool
+      # timeouts under load.
+      INGESTION_WORKER_CONCURRENCY: '4'
+    volumes: ['./storage:/app/storage']
+    # Memory ceiling mirrors the restricted-memory serverless constraint. The
+    # pipeline streams bounded byte ranges, so this holds regardless of whether
+    # the vendor file is 30 MB or 30 GB. Observed peak ingesting the 500k-row
+    # file inside this container with the limit enforced: 84 MB.
+    mem_limit: 512m
+    # The worker serves no HTTP, so it cannot answer the API's probe. What it
+    # genuinely needs is the queue: a worker that cannot reach Redis consumes
+    # nothing, however alive the process looks.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const s=require('net').connect(6379,'redis');s.setTimeout(2000);s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));s.on('timeout',()=>process.exit(1));"
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
+  redisdata:

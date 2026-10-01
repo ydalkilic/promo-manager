@@ -1,0 +1,9 @@
+node_modules
+dist
+storage
+.env
+_bmad
+_bmad-output
+.git
+*.log
+coverage

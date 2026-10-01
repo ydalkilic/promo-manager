@@ -1,0 +1,20 @@
+# --- dependencies & build output ---
+node_modules/
+dist/
+coverage/
+
+# --- local environment (never commit credentials) ---
+.env
+.env.local
+
+# --- generated vendor files (28 MB+; recreate with npm run generate:vendor-file) ---
+storage/
+
+# --- logs & OS cruft ---
+*.log
+.DS_Store
+
+# --- local tooling, not part of the submission ---
+_bmad/
+_bmad-output/
+.claude/

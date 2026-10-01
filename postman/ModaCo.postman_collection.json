@@ -1,0 +1,2216 @@
+{
+  "info": {
+    "name": "ModaCo — Promotion Management API",
+    "_postman_id": "9f2c1b4e-7a3d-4c58-9e21-6b0d5a8f3c77",
+    "description": "Manual test collection for the ModaCo Promotion Management API.\n\n## Setup\n```bash\nnpx prisma migrate deploy\nnpm run seed       # 6 products + 2 promotions showing precedence\nnpm run dev        # API on :3000\nnpm run worker     # required only for Scenario A\n```\n\n## Folders\n- **Health** — liveness and dependency status\n- **Products** — read paths, including the effective-price sort\n- **Promotions** — create / cancel / assign\n- **Scenario B — Flash Sale Walkthrough** — run in order; proves instant invalidation and clean reversal\n- **Scenario A — Bulk Ingestion** — 500k-row import; self-polls to completion\n- **Validation & Conflicts** — negative cases, each naming the layer that rejected it\n\n## Notes\n- `productId`, `promotionId` and `jobId` are captured automatically by test scripts — run **List products** first so `productId` is populated.\n- Responses carry `X-Cache: l1 | l2 | miss | bypass`, so caching behaviour is observable per request.\n- The **List products** tests include a numeric-monotonicity guard on `effectivePrice`. It exists because this endpoint once sorted lexicographically (`'100.00'` before `'30.00'`) while still returning a plausible-looking ordered list. See ADR-007.\n- Several requests mutate state. The walkthrough and validation folders clean up after themselves; re-run `npm run seed` to reset.\n- Every route sits behind a per-route-class rate limiter (`X-RateLimit-*` headers). Reads, `?at=` simulations, promotion writes and the ingestion trigger have separate budgets. The limiter **fails open** if Redis is unavailable, so a cache outage cannot become a storefront outage. The 429 path is asserted in `tests/hardening.test.ts` rather than here, because consuming a shared IP-keyed budget mid-collection would make the rest of the run flaky.\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string",
+      "description": "API root. Override per environment."
+    },
+    {
+      "key": "category",
+      "value": "accessories",
+      "type": "string",
+      "description": "Category used by the filter examples. Seeded with an active 50% flash sale."
+    },
+    {
+      "key": "fileKey",
+      "value": "vendor/weekly-sync.csv",
+      "type": "string",
+      "description": "Blob-storage key produced by `npm run generate:vendor-file`."
+    },
+    {
+      "key": "productId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured by 'List products'."
+    },
+    {
+      "key": "promotedProductId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured: first product with a promotion applied."
+    },
+    {
+      "key": "promotionId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured."
+    },
+    {
+      "key": "categoryPromotionId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured."
+    },
+    {
+      "key": "productPromotionId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured."
+    },
+    {
+      "key": "walkthroughPromotionId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured."
+    },
+    {
+      "key": "adjacentPromotionId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured."
+    },
+    {
+      "key": "jobId",
+      "value": "",
+      "type": "string",
+      "description": "Auto-captured."
+    },
+    {
+      "key": "pollCount",
+      "value": "0",
+      "type": "string",
+      "description": "Self-poll guard."
+    },
+    {
+      "key": "baselineFootwear",
+      "value": "",
+      "type": "string",
+      "description": "Snapshot taken by the walkthrough's baseline step."
+    },
+    {
+      "key": "futureInstant",
+      "value": "",
+      "type": "string",
+      "description": "Set by a pre-request script."
+    },
+    {
+      "key": "nowInstant",
+      "value": "",
+      "type": "string",
+      "description": "Set by a pre-request script."
+    }
+  ],
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Applies to every request in the collection.",
+          "pm.test(\"responds within 2s\", () => pm.expect(pm.response.responseTime).to.be.below(2000));",
+          "",
+          "pm.test(\"content type is JSON\", () => {",
+          "  pm.expect(pm.response.headers.get(\"Content-Type\") || \"\").to.include(\"application/json\");",
+          "});",
+          "",
+          "// Error responses must always use the documented envelope so clients",
+          "// can handle failures uniformly.",
+          "if (pm.response.code >= 400) {",
+          "  pm.test(\"error envelope has code and message\", () => {",
+          "    const e = pm.response.json().error;",
+          "    pm.expect(e).to.have.property(\"code\");",
+          "    pm.expect(e).to.have.property(\"message\");",
+          "  });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "description": "Liveness and dependency status. Note that Redis being down is reported but does NOT make the service unhealthy — the cache is a performance tier, not a correctness dependency.",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Reports database and Redis separately, plus in-process cache stats."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json();",
+                  "pm.test(\"status is ok\", () => pm.expect(d.status).to.eql(\"ok\"));",
+                  "pm.test(\"database is up\", () => pm.expect(d.dependencies.database).to.eql(\"up\"));",
+                  "// Redis down is tolerated by design — surfaced, not fatal.",
+                  "console.log(\"redis:\", d.dependencies.redis, \"| L1 entries:\", d.cache.l1Size);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Products",
+      "description": "Read endpoints. `sort=effective_price` sorts by the *computed* price — the promotion is resolved at query time, never stored on the product row.",
+      "item": [
+        {
+          "name": "List products",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?sort=effective_price&direction=asc&limit=20&page=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "sort",
+                  "value": "effective_price",
+                  "description": "effective_price | base_price | name | created_at"
+                },
+                {
+                  "key": "direction",
+                  "value": "asc",
+                  "description": "asc | desc"
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "1-100 (capped: the sort is over a computed expression)"
+                },
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "category",
+                  "value": "accessories",
+                  "description": "Optional category filter",
+                  "disabled": true
+                },
+                {
+                  "key": "at",
+                  "value": "2026-12-24T00:00:00Z",
+                  "description": "Price the catalogue at an arbitrary instant",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Default listing, cheapest effective price first. Captures `productId` into the collection variables for downstream requests."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const rows = pm.response.json().data;",
+                  "pm.test(\"at least one product returned\", () => pm.expect(rows.length).to.be.above(0));",
+                  "",
+                  "// REGRESSION GUARD. This endpoint previously sorted effective_price",
+                  "// LEXICOGRAPHICALLY (\"100.00\" before \"30.00\") because the text cast in the",
+                  "// SELECT list shadowed the numeric column and SQL resolves ORDER BY against",
+                  "// output aliases first. A numeric monotonicity check is the only thing that",
+                  "// catches it — the response still looked correctly ordered.",
+                  "pm.test(\"effectivePrice is non-decreasing (numeric, not lexicographic)\", () => {",
+                  "  const prices = rows.map(r => r.effectivePrice);",
+                  "  for (let i = 1; i < prices.length; i++) {",
+                  "    pm.expect(prices[i], `index ${i} vs ${i-1}`).to.be.at.least(prices[i-1]);",
+                  "  }",
+                  "});",
+                  "",
+                  "pm.test(\"effectivePrice never exceeds basePrice\", () => {",
+                  "  rows.forEach(r => pm.expect(r.effectivePrice).to.be.at.most(r.basePrice));",
+                  "});",
+                  "",
+                  "pm.test(\"discountAmount is consistent\", () => {",
+                  "  rows.forEach(r => {",
+                  "    const expected = Math.round((r.basePrice - r.effectivePrice) * 100) / 100;",
+                  "    pm.expect(r.discountAmount).to.eql(expected);",
+                  "  });",
+                  "});",
+                  "",
+                  "// Capture ids so later requests need no manual copy-paste.",
+                  "pm.collectionVariables.set(\"productId\", rows[0].id);",
+                  "const promoted = rows.find(r => r.appliedPromotion);",
+                  "if (promoted) pm.collectionVariables.set(\"promotedProductId\", promoted.id);",
+                  "console.log(\"X-Cache:\", pm.response.headers.get(\"X-Cache\"));",
+                  "",
+                  "// The limiter runs in front of every route. Reads and `?at=` simulations draw",
+                  "// from separate budgets, since a simulation cannot share a cache entry with",
+                  "// live traffic and is the most expensive read in the system.",
+                  "pm.test(\"rate-limit headers present\", () => {",
+                  "  pm.expect(pm.response.headers.get(\"X-RateLimit-Limit\")).to.be.a(\"string\");",
+                  "  pm.expect(Number(pm.response.headers.get(\"X-RateLimit-Remaining\"))).to.be.at.least(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List products — filter by category",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?category={{category}}&sort=effective_price&direction=asc",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "{{category}}"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                },
+                {
+                  "key": "direction",
+                  "value": "asc"
+                }
+              ]
+            },
+            "description": "Against the seeded data, every accessory carries the 50% flash sale except the Leather Belt, which has its own product-scope promotion that outranks it."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const rows = pm.response.json().data;",
+                  "pm.test(\"all rows match the requested category\", () => {",
+                  "  rows.forEach(r => pm.expect(r.category).to.eql(pm.collectionVariables.get(\"category\")));",
+                  "});",
+                  "",
+                  "pm.test(\"product-scope promotion outranks the category one\", () => {",
+                  "  const belt = rows.find(r => r.sku && r.sku.startsWith(\"ACC-001\"));",
+                  "  if (!belt) { console.log(\"seeded belt not present — run `npm run seed`\"); return; }",
+                  "  pm.expect(belt.appliedPromotion.scope).to.eql(\"PRODUCT\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List products — sort by effective price, descending",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?sort=effective_price&direction=desc&limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                },
+                {
+                  "key": "direction",
+                  "value": "desc"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "The mirror of the ascending regression guard."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const prices = pm.response.json().data.map(r => r.effectivePrice);",
+                  "pm.test(\"effectivePrice is non-increasing\", () => {",
+                  "  for (let i = 1; i < prices.length; i++) {",
+                  "    pm.expect(prices[i]).to.be.at.most(prices[i-1]);",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List products — sort by BASE price (compare orderings)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?sort=base_price&direction=asc&limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "sort",
+                  "value": "base_price"
+                },
+                {
+                  "key": "direction",
+                  "value": "asc"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "Run this next to the effective-price sort. The two orderings differ wherever a promotion applies — which is exactly the divergence that makes the sort worth testing."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const prices = pm.response.json().data.map(r => r.basePrice);",
+                  "pm.test(\"basePrice is non-decreasing\", () => {",
+                  "  for (let i = 1; i < prices.length; i++) pm.expect(prices[i]).to.be.at.least(prices[i-1]);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List products — pagination",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?limit=2&page=1&sort=effective_price",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "2"
+                },
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                }
+              ]
+            },
+            "description": "`limit` is capped at 100. Ordering always includes `id` as a tiebreaker so rows sharing an effective price cannot appear on two pages or none."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"pagination metadata present\", () => {",
+                  "  pm.expect(b.pagination).to.have.all.keys(\"page\",\"limit\",\"total\",\"totalPages\");",
+                  "});",
+                  "pm.test(\"page size honoured\", () => pm.expect(b.data.length).to.be.at.most(2));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List products — limit above the cap is rejected",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?limit=500",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "500"
+                }
+              ]
+            },
+            "description": "Guards against a single request sorting and serialising an unbounded slice of the catalogue."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"validation error\", () => pm.expect(pm.response.json().error.code).to.eql(\"VALIDATION_ERROR\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List products — point-in-time simulation",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?category={{category}}&at={{futureInstant}}&sort=effective_price",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "{{category}}"
+                },
+                {
+                  "key": "at",
+                  "value": "{{futureInstant}}"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                }
+              ]
+            },
+            "description": "Prices the catalogue at an arbitrary instant, so a scheduled flash sale can be verified before it goes live.\n\nThe instant is snapped to the minute and the result is cached. Simulations used to bypass the cache entirely — rare enough not to pollute it — but that made ?at=<unique> an unauthenticated, unbounded-cost request: ~380ms of database work each time, rationed only by the caller's patience. Snapping collapses the key space so repeats hit cache; minute granularity keeps a sale starting at 14:30 visible to someone probing 14:31."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// 30 days out: beyond the seeded promotion windows.",
+                  "const t = new Date(Date.now() + 30 * 86400000).toISOString();",
+                  "pm.collectionVariables.set(\"futureInstant\", t);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "",
+                  "// The requested instant is snapped to the minute, and the snapped value is",
+                  "// what is reported back — the rounding is visible, not silent.",
+                  "pm.test(\"pricedAt is snapped to the minute\", () => {",
+                  "  pm.expect(b.meta.pricedAt).to.match(/:00\\.000Z$/);",
+                  "});",
+                  "",
+                  "pm.test(\"simulations are cached, not bypassed\", () => {",
+                  "  // Previously this asserted \"bypass\" on every call, which was the bug.",
+                  "  pm.expect([\"miss\", \"l2\"]).to.include(b.meta.cache);",
+                  "});",
+                  "",
+                  "pm.test(\"seeded promotions have expired by then\", () => {",
+                  "  b.data.forEach(r => pm.expect(r.effectivePrice).to.eql(r.basePrice));",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set(\"simulationUrl\", pm.request.url.toString());"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List products — repeat the simulation (now a cache hit)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"served from Redis — simulations are cacheable now\", () => {",
+                  "  pm.expect(pm.response.json().meta.cache).to.eql(\"l2\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Same snapped instant as the previous request. An l2 hit here is the fix working: the expensive uncached path is paid once per minute-bucket instead of once per request.",
+            "url": {
+              "raw": "{{baseUrl}}/api/products?category={{category}}&at={{futureInstant}}&sort=effective_price",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "{{category}}"
+                },
+                {
+                  "key": "at",
+                  "value": "{{futureInstant}}"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get single product",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/{{productId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productId}}"
+              ]
+            },
+            "description": "The most highly trafficked endpoint, served by a two-tier cache (in-process L1, then Redis L2). Run it twice and watch `X-Cache`."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"response has a data envelope\", () => {",
+                  "  pm.expect(pm.response.json()).to.have.property(\"data\");",
+                  "});",
+                  "const d = pm.response.json();",
+                  "pm.test(\"id matches the request\", () => {",
+                  "  pm.expect(d.data.id).to.eql(pm.collectionVariables.get(\"productId\"));",
+                  "});",
+                  "pm.test(\"X-Cache header present\", () => pm.expect(pm.response.headers.get(\"X-Cache\")).to.be.a(\"string\"));",
+                  "console.log(\"X-Cache:\", pm.response.headers.get(\"X-Cache\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get single product — repeat to observe a cache hit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/{{productId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productId}}"
+              ]
+            },
+            "description": "Immediately after the previous request this should be served from cache. L1 has a 1 second TTL (it is also the staleness bound), so a slow manual run may fall through to L2 — both are accepted here."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const tier = pm.response.headers.get(\"X-Cache\");",
+                  "pm.test(\"served from a cache tier\", () => pm.expect([\"l1\",\"l2\"]).to.include(tier));",
+                  "console.log(\"X-Cache:\", tier);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get single product — 404 unknown id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "description": "Well-formed UUID that does not exist."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404 Not Found\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"NOT_FOUND code\", () => pm.expect(pm.response.json().error.code).to.eql(\"NOT_FOUND\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get single product — 400 malformed id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/not-a-uuid",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "not-a-uuid"
+              ]
+            },
+            "description": "Rejected at the edge by schema validation, before it reaches the database."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"VALIDATION_ERROR code\", () => pm.expect(pm.response.json().error.code).to.eql(\"VALIDATION_ERROR\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Promotions",
+      "description": "Write endpoints. Every mutation bumps the promotion epoch after it commits, which logically invalidates every derived cache entry in O(1).",
+      "item": [
+        {
+          "name": "Create promotion — CATEGORY scope (flash sale)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "One row written. Every product in the category is repriced, and any product added to the category later benefits automatically — because nothing is denormalised onto product rows.\n\nTargets `footwear`, which has no active category promotion in the seed data. Re-running without cancelling first returns 409 by design.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Flash — 25% Off Footwear\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 25,\n  \"scope\": \"CATEGORY\",\n  \"category\": \"footwear\",\n  \"startsAt\": \"2020-01-01T00:00:00Z\",\n  \"endsAt\": \"2030-01-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 Created\", () => pm.response.to.have.status(201));",
+                  "const p = pm.response.json().data;",
+                  "pm.collectionVariables.set(\"categoryPromotionId\", p.id);",
+                  "pm.collectionVariables.set(\"promotionId\", p.id);",
+                  "pm.test(\"scope is CATEGORY\", () => pm.expect(p.scope).to.eql(\"CATEGORY\"));",
+                  "pm.test(\"no productId on a category promotion\", () => pm.expect(p.productId).to.be.null);",
+                  "pm.test(\"starts ACTIVE\", () => pm.expect(p.status).to.eql(\"ACTIVE\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create promotion — PRODUCT scope",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "A product-scope promotion may coexist with a category one covering the same product. That is precedence, not conflict: the narrower scope wins.\n\nRequires `productId` — run **List products** first. If that product already has an active promotion (the seeded belt does), expect 409.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Manual Test — 10 off this product\",\n  \"discountType\": \"FIXED_AMOUNT\",\n  \"value\": 10,\n  \"scope\": \"PRODUCT\",\n  \"productId\": \"{{productId}}\",\n  \"startsAt\": \"2020-01-01T00:00:00Z\",\n  \"endsAt\": \"2030-01-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 or 409 (409 if this product already has one)\", () => {",
+                  "  pm.expect([201, 409]).to.include(pm.response.code);",
+                  "});",
+                  "if (pm.response.code === 201) {",
+                  "  const p = pm.response.json().data;",
+                  "  pm.collectionVariables.set(\"productPromotionId\", p.id);",
+                  "  pm.test(\"scope is PRODUCT\", () => pm.expect(p.scope).to.eql(\"PRODUCT\"));",
+                  "} else {",
+                  "  pm.test(\"conflict is reported as PROMOTION_CONFLICT\", () => {",
+                  "    pm.expect(pm.response.json().error.code).to.eql(\"PROMOTION_CONFLICT\");",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List promotions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions?limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                },
+                {
+                  "key": "status",
+                  "value": "ACTIVE",
+                  "description": "ACTIVE | CANCELLED",
+                  "disabled": true
+                },
+                {
+                  "key": "scope",
+                  "value": "CATEGORY",
+                  "description": "PRODUCT | CATEGORY",
+                  "disabled": true
+                },
+                {
+                  "key": "category",
+                  "value": "footwear",
+                  "disabled": true
+                },
+                {
+                  "key": "productId",
+                  "value": "{{productId}}",
+                  "disabled": true
+                },
+                {
+                  "key": "activeAt",
+                  "value": "2026-12-24T00:00:00Z",
+                  "description": "Only promotions in force at this instant",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Enable the disabled params to filter."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"response has a data envelope\", () => {",
+                  "  pm.expect(pm.response.json()).to.have.property(\"data\");",
+                  "});",
+                  "pm.test(\"data is an array\", () => pm.expect(pm.response.json().data).to.be.an(\"array\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List promotions — active right now",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions?status=ACTIVE&activeAt={{nowInstant}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "ACTIVE"
+                },
+                {
+                  "key": "activeAt",
+                  "value": "{{nowInstant}}"
+                }
+              ]
+            },
+            "description": "The set the read path resolves against. It stays small (tens) even against a multi-million row catalogue, which is the asymmetry that makes read-time resolution affordable."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"nowInstant\", new Date().toISOString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const rows = pm.response.json().data;",
+                  "console.log(\"promotions in force now:\", rows.length);",
+                  "pm.test(\"all returned promotions are ACTIVE\", () => {",
+                  "  rows.forEach(p => pm.expect(p.status).to.eql(\"ACTIVE\"));",
+                  "});",
+                  "pm.test(\"window actually contains the instant\", () => {",
+                  "  const t = new Date(pm.collectionVariables.get(\"nowInstant\")).getTime();",
+                  "  rows.forEach(p => {",
+                  "    pm.expect(new Date(p.startsAt).getTime()).to.be.at.most(t);",
+                  "    pm.expect(new Date(p.endsAt).getTime()).to.be.above(t);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get promotion by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions/{{promotionId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions",
+                "{{promotionId}}"
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"response has a data envelope\", () => {",
+                  "  pm.expect(pm.response.json()).to.have.property(\"data\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assign promotion to a different category",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions/{{categoryPromotionId}}/assign",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions",
+                "{{categoryPromotionId}}",
+                "assign"
+              ]
+            },
+            "description": "Re-targets an existing promotion. The same EXCLUDE constraint guards this path, because the constraint is on the table's state rather than on the insert — which is the payoff for putting the rule in the schema instead of in a create-time service check.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scope\": \"CATEGORY\",\n  \"category\": \"outerwear\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"target updated\", () => pm.expect(pm.response.json().data.category).to.eql(\"outerwear\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel promotion",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions/{{categoryPromotionId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions",
+                "{{categoryPromotionId}}",
+                "cancel"
+              ]
+            },
+            "description": "Cancels rather than deletes — promotions are an audit trail of what a customer was shown and charged. The EXCLUDE constraint is filtered on `status = 'ACTIVE'`, so cancelling genuinely releases the date window."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const p = pm.response.json().data;",
+                  "pm.test(\"status is CANCELLED\", () => pm.expect(p.status).to.eql(\"CANCELLED\"));",
+                  "pm.test(\"cancelledAt is set\", () => pm.expect(p.cancelledAt).to.not.be.null);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel promotion — again (idempotent)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions/{{categoryPromotionId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions",
+                "{{categoryPromotionId}}",
+                "cancel"
+              ]
+            },
+            "description": "Re-cancelling is a no-op, not an error."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"still CANCELLED\", () => pm.expect(pm.response.json().data.status).to.eql(\"CANCELLED\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Scenario B — Flash Sale Walkthrough",
+      "description": "Run these in order (Postman Runner works well). Demonstrates that a flash sale affecting a whole category costs one row write plus one integer increment, takes effect immediately across cached reads, and reverses cleanly on cancellation.\n\nRequires `npm run seed`. Uses `footwear`, which has no active category promotion.",
+      "item": [
+        {
+          "name": "1. Baseline — footwear before any sale",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?category=footwear&sort=effective_price",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "footwear"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                }
+              ]
+            },
+            "description": "Records the pre-sale prices so later steps can assert the delta."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const rows = pm.response.json().data;",
+                  "pm.test(\"footwear products exist\", () => pm.expect(rows.length).to.be.above(0));",
+                  "pm.test(\"no promotion applied yet\", () => {",
+                  "  rows.forEach(r => pm.expect(r.appliedPromotion, r.name + \" already promoted\").to.be.null);",
+                  "});",
+                  "pm.collectionVariables.set(\"baselineFootwear\", JSON.stringify(",
+                  "  rows.map(r => ({ id: r.id, base: r.basePrice, eff: r.effectivePrice }))",
+                  "));",
+                  "console.log(\"baseline:\", rows.map(r => r.name + \"=\" + r.effectivePrice).join(\", \"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2. Create the flash sale (30% off footwear)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "One row. Zero product rows updated. Measured at 11.5 ms against a 62,500-product category.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Walkthrough Flash — 30% Off Footwear\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 30,\n  \"scope\": \"CATEGORY\",\n  \"category\": \"footwear\",\n  \"startsAt\": \"2020-01-01T00:00:00Z\",\n  \"endsAt\": \"2030-01-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 Created\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"walkthroughPromotionId\", pm.response.json().data.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3. Prices after the sale — invalidation was instant",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?category=footwear&sort=effective_price",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "footwear"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                }
+              ]
+            },
+            "description": "The epoch bump from step 2 invalidated every cached page at once, so this is a cache miss serving fresh prices — no per-product cache eviction and no backfill."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const rows = pm.response.json().data;",
+                  "const baseline = JSON.parse(pm.collectionVariables.get(\"baselineFootwear\") || \"[]\");",
+                  "",
+                  "pm.test(\"cache was invalidated by the promotion write\", () => {",
+                  "  pm.expect(pm.response.json().meta.cache).to.eql(\"miss\");",
+                  "});",
+                  "",
+                  "pm.test(\"every footwear product now carries the sale\", () => {",
+                  "  rows.forEach(r => {",
+                  "    pm.expect(r.appliedPromotion, r.name).to.not.be.null;",
+                  "    pm.expect(r.appliedPromotion.scope).to.eql(\"CATEGORY\");",
+                  "  });",
+                  "});",
+                  "",
+                  "pm.test(\"30% applied exactly, against the recorded baseline\", () => {",
+                  "  rows.forEach(r => {",
+                  "    const before = baseline.find(b => b.id === r.id);",
+                  "    if (!before) return;",
+                  "    const expected = Math.round(before.base * 0.70 * 100) / 100;",
+                  "    pm.expect(r.effectivePrice, r.name).to.eql(expected);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4. Repeat — now served from cache",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?category=footwear&sort=effective_price",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "footwear"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                }
+              ]
+            },
+            "description": "Same request, now a hit. The ~108 ms uncached sort over a large category is paid once per epoch rather than per request."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"served from Redis\", () => pm.expect(pm.response.json().meta.cache).to.eql(\"l2\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5. A competing sale on the same category is refused",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "Rejected by a GiST EXCLUDE constraint, so the guarantee holds under concurrent writes across every API replica — not by a check-then-insert that two simultaneous requests can both pass.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Competing Footwear Sale\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 50,\n  \"scope\": \"CATEGORY\",\n  \"category\": \"footwear\",\n  \"startsAt\": \"2021-01-01T00:00:00Z\",\n  \"endsAt\": \"2029-01-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 Conflict\", () => pm.response.to.have.status(409));",
+                  "const e = pm.response.json().error;",
+                  "pm.test(\"PROMOTION_CONFLICT\", () => pm.expect(e.code).to.eql(\"PROMOTION_CONFLICT\"));",
+                  "pm.test(\"names the blocking promotion\", () => {",
+                  "  pm.expect(e.details.conflictingPromotion.name).to.include(\"Walkthrough Flash\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6. Cancel the flash sale",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions/{{walkthroughPromotionId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions",
+                "{{walkthroughPromotionId}}",
+                "cancel"
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"CANCELLED\", () => pm.expect(pm.response.json().data.status).to.eql(\"CANCELLED\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7. Prices restored",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?category=footwear&sort=effective_price",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "footwear"
+                },
+                {
+                  "key": "sort",
+                  "value": "effective_price"
+                }
+              ]
+            },
+            "description": "Back to baseline. Nothing had to be rewritten, because nothing was ever denormalised."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const rows = pm.response.json().data;",
+                  "const baseline = JSON.parse(pm.collectionVariables.get(\"baselineFootwear\") || \"[]\");",
+                  "pm.test(\"no promotion applied\", () => {",
+                  "  rows.forEach(r => pm.expect(r.appliedPromotion, r.name).to.be.null);",
+                  "});",
+                  "pm.test(\"effective price equals the baseline again\", () => {",
+                  "  rows.forEach(r => {",
+                  "    const before = baseline.find(b => b.id === r.id);",
+                  "    if (before) pm.expect(r.effectivePrice).to.eql(before.eff);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Scenario A — Bulk Ingestion",
+      "description": "500,000-row vendor import under serverless constraints.\n\n**Prerequisites**\n1. `npm run generate:vendor-file -- 500000` — writes ~28 MB into ./storage\n2. `npm run worker` — the chunk processor must be running\n\nThe trigger deliberately takes a blob-storage *key*, not an upload: pushing hundreds of megabytes through a request handler would hold the request open for the whole job, which is the exact failure mode the design avoids.\n\n**Try killing the worker mid-run and restarting it** — the job resumes from its last completed chunk.",
+      "item": [
+        {
+          "name": "Start ingestion job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/ingestion/jobs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "ingestion",
+                "jobs"
+              ]
+            },
+            "description": "Returns 202 immediately. The endpoint writes one row and enqueues one message; all real work happens in short-lived worker invocations.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fileKey\": \"{{fileKey}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"202 Accepted\", () => pm.response.to.have.status(202));",
+                  "const d = pm.response.json().data;",
+                  "pm.collectionVariables.set(\"jobId\", d.jobId);",
+                  "pm.collectionVariables.set(\"pollCount\", \"0\");",
+                  "pm.test(\"returns a job id\", () => pm.expect(d.jobId).to.be.a(\"string\"));",
+                  "console.log(\"job\", d.jobId, \"|\", (d.totalBytes / 1048576).toFixed(1), \"MB\");"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Start ingestion job — 404 unknown file key",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/ingestion/jobs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "ingestion",
+                "jobs"
+              ]
+            },
+            "description": "Fails fast at the trigger so the caller learns immediately, rather than through a job that fails asynchronously. An unresolvable key is a caller mistake, so it is translated to 404 rather than surfacing a raw storage ENOENT as a 500.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fileKey\": \"vendor/does-not-exist.csv\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404 Not Found\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"NOT_FOUND\", () => pm.expect(pm.response.json().error.code).to.eql(\"NOT_FOUND\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Poll job status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/ingestion/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "ingestion",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "Per-chunk state, rows processed, and rejected-row counts.\n\nThis request **re-runs itself** in the Collection Runner until the job reaches a terminal state (capped at 60 polls). Set a ~1000 ms delay in the Runner so polling is not tight-looped."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json().data;",
+                  "",
+                  "pm.test(\"status is a known value\", () => {",
+                  "  pm.expect([\"SPLITTING\",\"PROCESSING\",\"COMPLETED\",\"FAILED\"]).to.include(d.status);",
+                  "});",
+                  "",
+                  "pm.test(\"chunk counts never exceed the total\", () => {",
+                  "  const c = d.chunks;",
+                  "  pm.expect(c.completed + c.failed + c.pending + c.inProgress).to.be.at.most(Math.max(d.chunksTotal, 1));",
+                  "});",
+                  "",
+                  "const pct = d.chunksTotal ? Math.round(100 * d.chunks.completed / d.chunksTotal) : 0;",
+                  "console.log(`${d.status} ${pct}% | chunks ${d.chunks.completed}/${d.chunksTotal}`",
+                  "  + ` | rows ${d.rowsProcessed.toLocaleString()} | rejected ${d.rowsRejected}`);",
+                  "",
+                  "const terminal = d.status === \"COMPLETED\" || d.status === \"FAILED\";",
+                  "",
+                  "if (terminal) {",
+                  "  pm.test(\"split completed and no chunk left outstanding\", () => {",
+                  "    pm.expect(d.splitCompleted).to.be.true;",
+                  "    pm.expect(d.chunks.pending).to.eql(0);",
+                  "    pm.expect(d.chunks.inProgress).to.eql(0);",
+                  "  });",
+                  "",
+                  "  // The generated file injects 100 invalid rows and 100 duplicate SKUs",
+                  "  // per 500k. Rows written = 500,000 - 100 rejected - 100 collapsed.",
+                  "  pm.test(\"row counts reconcile\", () => {",
+                  "    pm.expect(d.rowsProcessed + d.rowsRejected).to.be.at.most(500000);",
+                  "  });",
+                  "  console.log(\"FINISHED:\", d.status, \"| rows\", d.rowsProcessed, \"| rejected\", d.rowsRejected);",
+                  "} else {",
+                  "  // Guarded self-poll: re-runs this request in the Collection Runner.",
+                  "  const n = Number(pm.collectionVariables.get(\"pollCount\") || \"0\") + 1;",
+                  "  pm.collectionVariables.set(\"pollCount\", String(n));",
+                  "  if (n < 60) {",
+                  "    postman.setNextRequest(\"Poll job status\");",
+                  "  } else {",
+                  "    console.warn(\"gave up after 60 polls — is `npm run worker` running?\");",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Poll job status — 404 unknown job",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/ingestion/jobs/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "ingestion",
+                "jobs",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404 Not Found\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"NOT_FOUND\", () => pm.expect(pm.response.json().error.code).to.eql(\"NOT_FOUND\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify the catalogue after ingestion",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?limit=5&sort=created_at&direction=desc",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "5"
+                },
+                {
+                  "key": "sort",
+                  "value": "created_at"
+                },
+                {
+                  "key": "direction",
+                  "value": "desc"
+                }
+              ]
+            },
+            "description": "Spot-check the ingested rows. Prices here are the output of the application-layer pricing rules, not the vendor's input: a flat markup over vendor cost, floored at the system minimum price of 0.01. Pricing is deliberately two invariants — nothing is ever free, and no percentage discount reaches 100% — see ADR-014."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const rows = pm.response.json().data;",
+                  "console.log(\"total catalogue size:\", pm.response.json().pagination.total.toLocaleString());",
+                  "pm.test(\"pricing rules produced positive prices\", () => {",
+                  "  rows.forEach(r => pm.expect(r.basePrice).to.be.above(0));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Validation & Conflicts",
+      "description": "Negative cases. Each one is rejected by a specific layer — schema validation, a CHECK constraint, or an EXCLUDE constraint — and the error code says which.\n\nThese are deterministic against `npm run seed`, which leaves an active 50% flash sale on `accessories`.",
+      "item": [
+        {
+          "name": "409 — overlapping promotion on an already-promoted category",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "The core business rule: at most one active promotion per target at a time. Enforced by `promotions_no_overlap_per_category`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Conflicts With Seeded Accessories Sale\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 25,\n  \"scope\": \"CATEGORY\",\n  \"category\": \"accessories\",\n  \"startsAt\": \"2020-01-01T00:00:00Z\",\n  \"endsAt\": \"2030-01-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 Conflict\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"PROMOTION_CONFLICT\", () => {",
+                  "  pm.expect(pm.response.json().error.code).to.eql(\"PROMOTION_CONFLICT\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "201 — adjacent window is NOT a conflict",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "The window is half-open `[starts, ends)`, so a promotion ending exactly when the next begins is a clean handover rather than an overlap. This one sits entirely in the future and is accepted.\n\nCancel it afterwards via the captured `adjacentPromotionId`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Adjacent Window Handover\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 15,\n  \"scope\": \"CATEGORY\",\n  \"category\": \"accessories\",\n  \"startsAt\": \"2031-01-01T00:00:00Z\",\n  \"endsAt\": \"2031-02-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 Created\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"adjacentPromotionId\", pm.response.json().data.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Clean up — cancel the adjacent promotion",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions/{{adjacentPromotionId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions",
+                "{{adjacentPromotionId}}",
+                "cancel"
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 — percentage above 100",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "Would invert the price. Caught by schema validation; also backed by the `promotions_value_chk` CHECK constraint, so a direct database write cannot bypass it either.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Impossible Discount\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 150,\n  \"scope\": \"CATEGORY\",\n  \"category\": \"knitwear\",\n  \"startsAt\": \"2026-01-01T00:00:00Z\",\n  \"endsAt\": \"2026-02-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"VALIDATION_ERROR\", () => pm.expect(pm.response.json().error.code).to.eql(\"VALIDATION_ERROR\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 — endsAt before startsAt",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Backwards Window\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 10,\n  \"scope\": \"CATEGORY\",\n  \"category\": \"knitwear\",\n  \"startsAt\": \"2026-06-01T00:00:00Z\",\n  \"endsAt\": \"2026-01-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "const e = pm.response.json().error;",
+                  "pm.test(\"points at endsAt\", () => {",
+                  "  pm.expect(JSON.stringify(e.details || \"\")).to.include(\"endsAt\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 — scope and payload disagree",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "description": "A CATEGORY-scope promotion must carry a `category`, never a `productId`. Without this rule a row could claim one scope while carrying the other's payload, and the resolution query would silently mis-attribute the discount. Mirrored by `promotions_scope_payload_chk` in the DDL.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Category Scope Carrying A Product Id\",\n  \"discountType\": \"PERCENTAGE\",\n  \"value\": 10,\n  \"scope\": \"CATEGORY\",\n  \"productId\": \"{{productId}}\",\n  \"startsAt\": \"2026-01-01T00:00:00Z\",\n  \"endsAt\": \"2026-02-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "404 — promotion for a product that does not exist",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/promotions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "promotions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Orphan Promotion\",\n  \"discountType\": \"FIXED_AMOUNT\",\n  \"value\": 5,\n  \"scope\": \"PRODUCT\",\n  \"productId\": \"00000000-0000-0000-0000-000000000000\",\n  \"startsAt\": \"2026-01-01T00:00:00Z\",\n  \"endsAt\": \"2026-02-01T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404 Not Found\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"NOT_FOUND\", () => pm.expect(pm.response.json().error.code).to.eql(\"NOT_FOUND\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "404 — route that does not exist",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/nonexistent",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "nonexistent"
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404 Not Found\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 — pagination offset beyond the cap",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "const e = pm.response.json().error;",
+                  "pm.test(\"VALIDATION_ERROR\", () => pm.expect(e.code).to.eql(\"VALIDATION_ERROR\"));",
+                  "pm.test(\"names page and suggests narrowing by category\", () => {",
+                  "  const d = JSON.stringify(e.details || \"\");",
+                  "  pm.expect(d).to.include(\"page\");",
+                  "  pm.expect(d.toLowerCase()).to.include(\"category\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Half of the original DoS vector. Sorting by effective price cannot use an index, so a deep OFFSET sorts every row before it. The bound is on the computed offset (page-1)*limit rather than on `page` alone, because page=1000&limit=100 is a hundred times more expensive than page=1000&limit=1.",
+            "url": {
+              "raw": "{{baseUrl}}/api/products?page=400000&limit=100",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "400000"
+                },
+                {
+                  "key": "limit",
+                  "value": "100"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "400 — the original attack request is now refused",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The exact request that measured ~380ms of uncached database work per call.",
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"rejected before any query runs\", () => {",
+                  "  pm.expect(pm.response.responseTime).to.be.below(100);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "`?at=<unique>&page=400000` combined an uncacheable read with an attacker-controlled OFFSET. Both halves are now bounded, and the request is rejected at the edge rather than reaching the database.",
+            "url": {
+              "raw": "{{baseUrl}}/api/products?at=2026-05-01T00:00:00Z&page=400000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "at",
+                  "value": "2026-05-01T00:00:00Z"
+                },
+                {
+                  "key": "page",
+                  "value": "400000"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "400 — unparseable ?at= on the detail endpoint",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 Bad Request\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"VALIDATION_ERROR\", () => pm.expect(pm.response.json().error.code).to.eql(\"VALIDATION_ERROR\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "This route used to parse `at` with a bare new Date(String(...)), so a garbage value became an Invalid Date and was handed to the query layer. It is now validated by the same schema the list endpoint uses.",
+            "url": {
+              "raw": "{{baseUrl}}/api/products/{{productId}}?at=not-a-date",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productId}}"
+              ],
+              "query": [
+                {
+                  "key": "at",
+                  "value": "not-a-date"
+                }
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

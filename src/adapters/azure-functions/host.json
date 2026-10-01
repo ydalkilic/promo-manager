@@ -1,0 +1,23 @@
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": { "samplingSettings": { "isEnabled": true } }
+  },
+
+  "//functionTimeout": "Hard platform kill. Must exceed INGESTION_INVOCATION_BUDGET_MS so the pipeline yields voluntarily before the platform intervenes. 10 minutes is the Consumption plan maximum.",
+  "functionTimeout": "00:05:00",
+
+  "extensions": {
+    "queues": {
+      "//batchSize": "Per-instance concurrency. Each concurrent chunk holds a Postgres connection; keep modest and front the database with a pooler.",
+      "batchSize": 4,
+      "newBatchThreshold": 2,
+
+      "//maxDequeueCount": "Must be >= INGESTION_MAX_ATTEMPTS so the application records a terminal failure on the chunk before the platform gives up on it.",
+      "maxDequeueCount": 5,
+
+      "visibilityTimeout": "00:02:00",
+      "maxPollingInterval": "00:00:02"
+    }
+  }
+}
